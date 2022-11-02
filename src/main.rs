@@ -85,7 +85,7 @@ async fn handle_connection(socket: TcpStream, db: Db) {
         } else if header == store {
             match rd.read_exact(&mut separator).await {
                 Ok(_) => {
-                    if separator != b"$" {continue;}
+                    if separator != b"$" {break;}
                     let mut key = Vec::new();
                     let mut buff = vec![0; 1];
 
