@@ -1,12 +1,20 @@
+use tokio::io::BufReader;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use std::str;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use std::collections::HashMap;
+use std::io::Error;
 use std::sync::{Arc, Mutex};
 use colored::Colorize;
+use regex::Regex;
 
 type Db = Arc<Mutex<HashMap<String, String>>>;
+
+// Error returned when something goes wrong during a task's work.
+// We do not care what really happened because in every case we just
+// finish the task and close the connection with the client.
+#[derive(Debug)]
+pub struct TaskError;
 
 #[tokio::main]
 async fn main() {
@@ -33,87 +41,78 @@ async fn main() {
         let db = db.clone();
 
         tokio::spawn(async move {
-            handle_connection(socket, db).await;
+            match handle_connection(socket, db).await {
+                Ok(_) => (),
+                Err(_) => ()
+            };
         });
     }
 }
 
-async fn handle_connection(socket: TcpStream, db: Db) {
-    let (mut rd, mut wr) = io::split(socket);
+async fn handle_connection(socket: TcpStream, db: Db) -> Result<(), Error> {
+    let (rd, mut wr) = io::split(socket);
     
     let store = b"STORE";
     let load = b"LOAD$";
+
+    let mut buf_reader = BufReader::new(rd);
 
     loop {
         let mut header = vec![0; 5];
         let mut separator = vec![0; 1];
 
-        match rd.read_exact(&mut header).await {
-            Ok(_) => (),
-            Err(_) => return,
-        }
+        buf_reader.read_exact(&mut header).await?;
 
         if header == load {
-            let mut key = Vec::new();
+            let mut key = String::new();
             let mut buff = vec![0; 1];
 
-            while rd.read_exact(&mut buff).await.unwrap() == 1 && buff != b"$" {
-                key.push(buff[0]);
+            while buf_reader.read_exact(&mut buff).await.unwrap() == 1 && buff != b"$" {
+                key.push(buff[0] as char);
             }
 
-            let mut value = String::from("not_found");
-            match db.lock() {
-                Ok(db) => {
-                    if db.contains_key(&String::from(str::from_utf8(&key).unwrap())) {
-                        value = String::from(db.get(str::from_utf8(&key).unwrap()).unwrap().as_str());
-                    }
-                },
-                Err(_) => return,
+            let mut value = None;
+
+            if !is_valid(key.clone()) {break;}
+        
+            if db.lock().unwrap().contains_key(&key) {
+                value = Some(String::from(db.lock().unwrap().get(&key).unwrap()));
             }
 
-            if value != "not_found" {
-                match wr.write_all(format!("FOUND${}$", value).as_bytes()).await {
-                    Ok(_) => (),
-                    Err(_) => return,
-                }
+            if value != None {
+                wr.write_all(format!("FOUND${}$", value.unwrap()).as_bytes()).await?;
             } else {
-                match wr.write_all(b"NOTFOUND$").await {
-                    Ok(_) => (),
-                    Err(_) => return,
-                }
+                wr.write_all(b"NOTFOUND$").await?
             }
         } else if header == store {
-            match rd.read_exact(&mut separator).await {
-                Ok(_) => {
-                    if separator != b"$" {break;}
-                    let mut key = Vec::new();
-                    let mut buff = vec![0; 1];
+            buf_reader.read_exact(&mut separator).await?;
+            if separator != b"$" {break;}
+            let mut key = String::new();
+            let mut buff = vec![0; 1];
 
-                    while rd.read_exact(&mut buff).await.is_ok() && buff != b"$" {
-                        key.push(buff[0]);
-                    }
-
-                    let mut value = Vec::new();
-                    while rd.read_exact(&mut buff).await.is_ok() && buff != b"$" {
-                        value.push(buff[0]);
-                    }
-
-                    match db.lock() {
-                        Ok(mut db) => {
-                            db.insert(String::from(str::from_utf8(&key[..]).unwrap()), String::from(str::from_utf8(&value[..]).unwrap()));
-                    
-                        },
-                        Err(_) => return,
-                    }
-                    
-                    match wr.write_all(b"DONE$").await {
-                        Ok(_) => (),
-                        Err(_) => return,
-                    }
-                },
-                Err(_) => return,
+            while buf_reader.read_exact(&mut buff).await.is_ok() && buff != b"$" {
+                key.push(buff[0] as char);
             }
+
+            let mut value = String::new();
+            while buf_reader.read_exact(&mut buff).await.is_ok() && buff != b"$" {
+                value.push(buff[0] as char);
+            }
+
+            if !is_valid(key.clone()) {break;}
+            if !is_valid(key.clone()) {break;}
+
+            db.lock().unwrap().insert(key, value);
+            
+            wr.write_all(b"DONE$").await?;
         }
     }
+    Ok(())
+}
 
+fn is_valid(s: String) -> bool {
+    match Regex::new(r"^[a-z]*") {
+        Ok(store_regex) => store_regex.is_match(s.as_str()),
+        Err(_) => false
+    }
 }
